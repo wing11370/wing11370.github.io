@@ -1,7 +1,268 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>商品庫存確認 - Chiikawa Market</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      padding: 20px;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin-bottom: 16px;
+      color: #444;
+    }
+    #product-link {
+      font-size: 0.85rem;
+      color: #888;
+      margin-bottom: 20px;
+      word-break: break-all;
+    }
+    #product-link a { color: #0066cc; }
+    #status-bar {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    #spinner {
+      width: 20px; height: 20px;
+      border: 3px solid #ddd;
+      border-top-color: #0066cc;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #status-text { font-size: 0.9rem; color: #555; }
+    #last-updated { font-size: 0.8rem; color: #aaa; margin-left: auto; white-space: nowrap; }
+
+    #product-card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    #product-title { font-size: 1.1rem; font-weight: bold; margin-bottom: 6px; }
+    #product-vendor { font-size: 0.85rem; color: #888; margin-bottom: 16px; }
+
+    #variants-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+    #variants-table th {
+      background: #f0f0f0;
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 2px solid #ddd;
+    }
+    #variants-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid #eee;
+    }
+    #variants-table tr:last-child td { border-bottom: none; }
+
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 0.8rem;
+      font-weight: bold;
+    }
+    .badge-available { background: #d4edda; color: #155724; }
+    .badge-soldout   { background: #f8d7da; color: #721c24; }
+
+    #refresh-btn {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 8px 20px;
+      background: #0066cc;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    #refresh-btn:hover { background: #0052a3; }
+    #refresh-btn:disabled { background: #aaa; cursor: not-allowed; }
+
+    #auto-refresh-label { font-size: 0.85rem; color: #666; margin-left: 12px; vertical-align: middle; }
+    #countdown { font-weight: bold; color: #0066cc; }
+
+    #error-box {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 8px;
+      padding: 16px;
+      font-size: 0.875rem;
+      color: #856404;
+      display: none;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
 <body>
-<h1>Hello World</h1>
-<p>I'm hosted with GitHub Pages.</p>
+  <h1>🛒 商品庫存確認</h1>
+  <div id="product-link">
+    來源：<a id="product-source-link" href="#" target="_blank" rel="noopener"></a>
+  </div>
+
+  <div id="status-bar">
+    <div id="spinner"></div>
+    <span id="status-text">讀取中…</span>
+    <span id="last-updated"></span>
+  </div>
+
+  <div id="error-box"></div>
+
+  <div id="product-card">
+    <div id="product-title"></div>
+    <div id="product-vendor"></div>
+    <table id="variants-table">
+      <thead>
+        <tr>
+          <th>規格</th>
+          <th>售價</th>
+          <th>庫存狀態</th>
+        </tr>
+      </thead>
+      <tbody id="variants-body"></tbody>
+    </table>
+  </div>
+
+  <button id="refresh-btn" onclick="fetchInventory()">🔄 立即重新整理</button>
+  <span id="auto-refresh-label">自動更新：<span id="countdown">30</span> 秒後</span>
+
+  <script>
+    const DEFAULT_PRODUCT_HANDLE = '4571609386872';
+    const DEFAULT_SHOP_ORIGIN = 'https://chiikawamarket.jp';
+    const SHOPIFY_DEFAULT_VARIANT_TITLE = 'Default Title';
+    const REFRESH_INTERVAL = 30;
+    const HTTP_ERROR_LABELS = { 401: '未授權', 403: '禁止存取', 404: '找不到商品', 429: '請求過於頻繁', 500: '伺服器錯誤', 503: '服務暫時無法使用' };
+
+    // Allow overriding via ?url=https://example.com/products/handle (with or without .json)
+    // or ?handle=xxx&shop=https://example.com
+    const params = new URLSearchParams(location.search);
+    let productPageUrl, productJsonUrl;
+    if (params.get('url')) {
+      productPageUrl = params.get('url').replace(/\.json$/, '');
+      productJsonUrl = productPageUrl + '.json';
+    } else {
+      const shop = (params.get('shop') || DEFAULT_SHOP_ORIGIN).replace(/\/$/, '');
+      const handle = params.get('handle') || DEFAULT_PRODUCT_HANDLE;
+      productPageUrl = shop + '/products/' + handle;
+      productJsonUrl = productPageUrl + '.json';
+    }
+
+    // Update the source link in the header
+    const srcLink = document.getElementById('product-source-link');
+    srcLink.href = productPageUrl;
+    srcLink.textContent = productPageUrl;
+
+    let timer = null;
+    let countdown = REFRESH_INTERVAL;
+
+    function setStatus(text, loading) {
+      document.getElementById('status-text').textContent = text;
+      document.getElementById('spinner').style.display = loading ? 'block' : 'none';
+    }
+
+    function showError(msg) {
+      const box = document.getElementById('error-box');
+      box.textContent = '⚠️ ' + msg;
+      box.style.display = 'block';
+    }
+
+    function hideError() {
+      document.getElementById('error-box').style.display = 'none';
+    }
+
+    function formatPrice(price) {
+      return '¥' + Number(price).toLocaleString('ja-JP');
+    }
+
+    function renderProduct(data) {
+      const p = data.product;
+      document.getElementById('product-title').textContent = p.title;
+      document.getElementById('product-vendor').textContent = p.vendor + (p.product_type ? ' ／ ' + p.product_type : '');
+
+      const tbody = document.getElementById('variants-body');
+      tbody.innerHTML = '';
+
+      p.variants.forEach(v => {
+        const tr = document.createElement('tr');
+        // Build a human-readable option label from individual option values;
+        // fall back to the variant title only when no option values are set at all.
+        const optionParts = [v.option1, v.option2, v.option3].filter(
+          o => o && o !== SHOPIFY_DEFAULT_VARIANT_TITLE
+        );
+        const title = optionParts.length ? optionParts.join(' / ') : v.title;
+        const avail = v.available;
+        tr.innerHTML =
+          '<td>' + escHtml(title) + '</td>' +
+          '<td>' + formatPrice(v.price) + '</td>' +
+          '<td><span class="badge ' + (avail ? 'badge-available' : 'badge-soldout') + '">' +
+          (avail ? '✅ 有庫存' : '❌ 售罄') + '</span></td>';
+        tbody.appendChild(tr);
+      });
+
+      document.getElementById('product-card').style.display = 'block';
+    }
+
+    function escHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function fetchInventory() {
+      hideError();
+      setStatus('讀取中…', true);
+      document.getElementById('refresh-btn').disabled = true;
+
+      try {
+        const res = await fetch(productJsonUrl);
+        if (!res.ok) {
+          throw new Error('伺服器回傳錯誤（' + res.status + (HTTP_ERROR_LABELS[res.status] ? '：' + HTTP_ERROR_LABELS[res.status] : '') + '）');
+        }
+        const data = await res.json();
+        renderProduct(data);
+        const now = new Date().toLocaleString('zh-TW');
+        document.getElementById('last-updated').textContent = '最後更新：' + now;
+        setStatus('資料已更新', false);
+      } catch (e) {
+        setStatus('讀取失敗', false);
+        showError('無法取得商品資料（' + e.message + '）。請確認網路連線或稍後再試。');
+      }
+
+      document.getElementById('refresh-btn').disabled = false;
+      resetCountdown();
+    }
+
+    function resetCountdown() {
+      clearInterval(timer);
+      countdown = REFRESH_INTERVAL;
+      document.getElementById('countdown').textContent = countdown;
+      timer = setInterval(() => {
+        countdown--;
+        document.getElementById('countdown').textContent = countdown;
+        if (countdown <= 0) {
+          fetchInventory();
+        }
+      }, 1000);
+    }
+
+    fetchInventory();
+  </script>
 </body>
 </html>
